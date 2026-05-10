@@ -1,0 +1,280 @@
+import { EventEmitter } from "node:events";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const fetchMock = vi.fn();
+const spawnMock = vi.hoisted(() => vi.fn());
+
+vi.stubGlobal("fetch", fetchMock);
+
+vi.mock("node:child_process", async () => {
+  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  return {
+    ...actual,
+    spawn: spawnMock,
+  };
+});
+
+import plugin from "./plugin.js";
+
+class MockChildProcess extends EventEmitter {
+  stdout = new EventEmitter();
+  stderr = new EventEmitter();
+  stdin = {
+    written: "" as string,
+    ended: false,
+    write: (chunk: string) => {
+      this.stdin.written += chunk;
+      return true;
+    },
+    end: () => {
+      this.stdin.ended = true;
+    },
+  };
+  kill = vi.fn();
+
+  constructor(input: { code?: number; signal?: string | null; stdout?: string; stderr?: string }) {
+    super();
+    queueMicrotask(() => {
+      if (input.stdout) this.stdout.emit("data", input.stdout);
+      if (input.stderr) this.stderr.emit("data", input.stderr);
+      this.emit("close", input.code ?? 0, input.signal ?? null);
+    });
+  }
+}
+
+function queueSpawnResult(input: { code?: number; signal?: string | null; stdout?: string; stderr?: string }) {
+  spawnMock.mockImplementationOnce(() => new MockChildProcess(input));
+}
+
+describe("exe.dev sandbox provider plugin", () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    spawnMock.mockReset();
+    delete process.env.EXE_API_KEY;
+  });
+
+  it("declares environment lifecycle handlers", async () => {
+    expect(await plugin.definition.onHealth?.()).toEqual({
+      status: "ok",
+      message: "exe.dev sandbox provider plugin healthy",
+    });
+    expect(plugin.definition.onEnvironmentAcquireLease).toBeTypeOf("function");
+    expect(plugin.definition.onEnvironmentExecute).toBeTypeOf("function");
+  });
+
+  it("normalizes config and emits SSH guidance warnings", async () => {
+    process.env.EXE_API_KEY = "host-key";
+
+    const result = await plugin.definition.onEnvironmentValidateConfig?.({
+      driverKey: "exe-dev",
+      config: {
+        apiUrl: "https://exe.dev",
+        namePrefix: " Paperclip Sandbox ",
+        image: " ubuntu:22.04 ",
+        cpu: "4.8",
+        memory: " 8GB ",
+        disk: " 50GB ",
+        env: {
+          FOO: " bar ",
+        },
+        integrations: [" github "],
+        tags: "prod, sandbox",
+        timeoutMs: "450000.9",
+        reuseLease: true,
+        sshPort: "2222",
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      warnings: [
+        "The Paperclip host must have SSH access to the created exe.dev VM. The API token only covers provisioning.",
+        "reuseLease keeps the VM alive between runs; this provider does not suspend retained VMs.",
+      ],
+      normalizedConfig: {
+        apiKey: null,
+        apiUrl: "https://exe.dev/exec",
+        namePrefix: "paperclip-sandbox",
+        image: "ubuntu:22.04",
+        command: null,
+        cpu: 4,
+        memory: "8GB",
+        disk: "50GB",
+        comment: null,
+        env: { FOO: "bar" },
+        integrations: ["github"],
+        tags: ["prod", "sandbox"],
+        setupScript: null,
+        prompt: null,
+        timeoutMs: 450000,
+        reuseLease: true,
+        sshUser: null,
+        sshIdentityFile: null,
+        sshPort: 2222,
+        strictHostKeyChecking: "accept-new",
+      },
+    });
+  });
+
+  it("rejects invalid config", async () => {
+    await expect(plugin.definition.onEnvironmentValidateConfig?.({
+      driverKey: "exe-dev",
+      config: {
+        apiUrl: "not-a-url",
+        cpu: 0,
+        env: {
+          "BAD-KEY": "value",
+        },
+        sshPort: 70000,
+        strictHostKeyChecking: "",
+        timeoutMs: 0,
+      },
+    })).resolves.toEqual({
+      ok: false,
+      warnings: [
+        "The Paperclip host must have SSH access to the created exe.dev VM. The API token only covers provisioning.",
+      ],
+      errors: [
+        "apiUrl must be a valid URL.",
+        "timeoutMs must be between 1 and 86400000.",
+        "cpu must be greater than 0 when provided.",
+        "sshPort must be between 1 and 65535.",
+        "exe.dev environments require an API key in config or EXE_API_KEY.",
+        "env contains an invalid key: BAD-KEY",
+        "strictHostKeyChecking cannot be empty.",
+      ],
+    });
+  });
+
+  it("acquires a lease by creating a VM and preparing the SSH workspace", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        vm_name: "paperclip-env-run",
+        ssh_dest: "paperclip-env-run.exe.xyz",
+        https_url: "https://paperclip-env-run.exe.xyz",
+        status: "running",
+      }), { status: 200 }),
+    );
+    queueSpawnResult({ stdout: "/home/exe\nbash\n" });
+    queueSpawnResult({});
+
+    const lease = await plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      runId: "run-1",
+      requestedCwd: "/workspace/custom",
+      config: {
+        apiKey: "api-key",
+        namePrefix: "paperclip",
+        image: "ubuntu:22.04",
+        timeoutMs: 300000,
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]?.[1]?.body ?? "")).toContain("new --json --no-email");
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    expect(lease).toMatchObject({
+      providerLeaseId: "paperclip-env-run",
+      metadata: {
+        provider: "exe-dev",
+        vmName: "paperclip-env-run",
+        sshDest: "paperclip-env-run.exe.xyz",
+        remoteCwd: "/workspace/custom",
+        shellCommand: "bash",
+        reuseLease: false,
+      },
+    });
+  });
+
+  it("returns an expired lease when the retained VM no longer exists", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ vms: [] }), { status: 200 }),
+    );
+
+    const lease = await plugin.definition.onEnvironmentResumeLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      providerLeaseId: "missing-vm",
+      config: {
+        apiKey: "api-key",
+      },
+      leaseMetadata: {
+        sshDest: "missing-vm.exe.xyz",
+      },
+    });
+
+    expect(lease).toEqual({
+      providerLeaseId: null,
+      metadata: {
+        expired: true,
+      },
+    });
+  });
+
+  it("executes commands over SSH with cwd, env, and stdin", async () => {
+    queueSpawnResult({ code: 0, stdout: "hello\n", stderr: "" });
+
+    const result = await plugin.definition.onEnvironmentExecute?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      config: {
+        apiKey: "api-key",
+        timeoutMs: 300000,
+      },
+      lease: {
+        providerLeaseId: "vm-1",
+        metadata: {
+          sshDest: "vm-1.exe.xyz",
+        },
+      },
+      command: "node",
+      args: ["-e", "process.stdout.write('hello\\n')"],
+      cwd: "/workspace",
+      env: {
+        FOO: "bar",
+      },
+      stdin: "input-body",
+      timeoutMs: 1000,
+    });
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock.mock.calls[0]?.[0]).toBe("ssh");
+    expect(String(spawnMock.mock.calls[0]?.[1]?.at(-1) ?? "")).toContain("/workspace");
+    expect(String(spawnMock.mock.calls[0]?.[1]?.at(-1) ?? "")).toContain("FOO='");
+    const child = spawnMock.mock.results[0]?.value as MockChildProcess;
+    expect(child.stdin.written).toBe("input-body");
+    expect(child.stdin.ended).toBe(true);
+    expect(result).toMatchObject({
+      exitCode: 0,
+      timedOut: false,
+      stdout: "hello\n",
+      stderr: "",
+      metadata: {
+        provider: "exe-dev",
+        vmName: "vm-1",
+      },
+    });
+  });
+
+  it("deletes non-reusable leases on release", async () => {
+    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200 }));
+
+    await plugin.definition.onEnvironmentReleaseLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      providerLeaseId: "vm-1",
+      config: {
+        apiKey: "api-key",
+        reuseLease: false,
+      },
+      leaseMetadata: {},
+    });
+
+    expect(String(fetchMock.mock.calls[0]?.[1]?.body ?? "")).toBe("rm --json 'vm-1'");
+  });
+});
