@@ -478,6 +478,7 @@ const SecretField = React.memo(({
   description,
   error,
   defaultValue,
+  maxLength,
 }: {
   value: unknown;
   onChange: (val: unknown) => void;
@@ -487,8 +488,10 @@ const SecretField = React.memo(({
   description?: string;
   error?: string;
   defaultValue?: unknown;
+  maxLength?: number;
 }) => {
   const [isVisible, setIsVisible] = useState(false);
+  const isTextArea = maxLength != null && maxLength > TEXTAREA_THRESHOLD;
   return (
     <FieldWrapper
       label={label}
@@ -500,34 +503,45 @@ const SecretField = React.memo(({
       error={error}
       disabled={disabled}
     >
-      <div className="relative">
-        <Input
-          type={isVisible ? "text" : "password"}
+      {isTextArea ? (
+        <Textarea
           value={String(value ?? "")}
           onChange={(e) => onChange(e.target.value)}
           placeholder={String(defaultValue ?? "")}
           disabled={disabled}
-          className="pr-10"
+          className="min-h-[140px] font-mono text-xs"
           aria-invalid={!!error}
         />
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="absolute right-0 top-0 h-full px-3 py-2 hover:bg-transparent"
-          onClick={() => setIsVisible(!isVisible)}
-          disabled={disabled}
-        >
-          {isVisible ? (
-            <EyeOff className="h-4 w-4 text-muted-foreground" />
-          ) : (
-            <Eye className="h-4 w-4 text-muted-foreground" />
-          )}
-          <span className="sr-only">
-            {isVisible ? "Hide secret" : "Show secret"}
-          </span>
-        </Button>
-      </div>
+      ) : (
+        <div className="relative">
+          <Input
+            type={isVisible ? "text" : "password"}
+            value={String(value ?? "")}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder={String(defaultValue ?? "")}
+            disabled={disabled}
+            className="pr-10"
+            aria-invalid={!!error}
+          />
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="absolute right-0 top-0 h-full px-3 py-2 hover:bg-transparent"
+            onClick={() => setIsVisible(!isVisible)}
+            disabled={disabled}
+          >
+            {isVisible ? (
+              <EyeOff className="h-4 w-4 text-muted-foreground" />
+            ) : (
+              <Eye className="h-4 w-4 text-muted-foreground" />
+            )}
+            <span className="sr-only">
+              {isVisible ? "Hide secret" : "Show secret"}
+            </span>
+          </Button>
+        </div>
+      )}
     </FieldWrapper>
   );
 });
@@ -885,6 +899,7 @@ const FormField = React.memo(({
           description={propSchema.description}
           error={error}
           defaultValue={propSchema.default}
+          maxLength={typeof propSchema.maxLength === "number" ? propSchema.maxLength : undefined}
         />
       );
 

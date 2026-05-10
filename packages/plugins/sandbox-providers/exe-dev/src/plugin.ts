@@ -1,5 +1,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import type {
@@ -36,6 +38,7 @@ interface ExeDevDriverConfig {
   timeoutMs: number;
   reuseLease: boolean;
   sshUser: string | null;
+  sshPrivateKey: string | null;
   sshIdentityFile: string | null;
   sshPort: number;
   strictHostKeyChecking: string;
@@ -175,6 +178,7 @@ function parseDriverConfig(raw: Record<string, unknown>): ExeDevDriverConfig {
     timeoutMs: Number.isFinite(timeoutMs) ? Math.trunc(timeoutMs) : DEFAULT_TIMEOUT_MS,
     reuseLease: raw.reuseLease === true,
     sshUser: parseOptionalString(raw.sshUser),
+    sshPrivateKey: parseOptionalString(raw.sshPrivateKey),
     sshIdentityFile: parseOptionalString(raw.sshIdentityFile),
     sshPort: Number.isFinite(sshPort) ? Math.trunc(sshPort) : 22,
     strictHostKeyChecking: parseOptionalString(raw.strictHostKeyChecking) ?? "accept-new",
@@ -375,7 +379,12 @@ function buildSshDestination(config: ExeDevDriverConfig, vm: ExeDevVmRecord): st
   return config.sshUser ? `${config.sshUser}@${vm.sshDest}` : vm.sshDest;
 }
 
-function buildSshArgs(config: ExeDevDriverConfig, vm: ExeDevVmRecord, remoteCommand: string): string[] {
+function buildSshArgs(
+  config: ExeDevDriverConfig,
+  vm: ExeDevVmRecord,
+  remoteCommand: string,
+  sshIdentityFile: string | null,
+): string[] {
   const args = [
     "-T",
     "-o",
@@ -387,11 +396,39 @@ function buildSshArgs(config: ExeDevDriverConfig, vm: ExeDevVmRecord, remoteComm
     "-p",
     String(config.sshPort),
   ];
-  if (config.sshIdentityFile) {
-    args.push("-i", config.sshIdentityFile, "-o", "IdentitiesOnly=yes");
+  if (sshIdentityFile) {
+    args.push("-i", sshIdentityFile, "-o", "IdentitiesOnly=yes");
   }
   args.push(buildSshDestination(config, vm), remoteCommand);
   return args;
+}
+
+async function prepareSshIdentity(config: ExeDevDriverConfig): Promise<{
+  sshIdentityFile: string | null;
+  cleanup: () => Promise<void>;
+}> {
+  if (!config.sshPrivateKey) {
+    return {
+      sshIdentityFile: config.sshIdentityFile,
+      cleanup: async () => {},
+    };
+  }
+
+  const tempDir = await mkdtemp(path.join(tmpdir(), "paperclip-exe-dev-ssh-"));
+  const sshIdentityFile = path.join(tempDir, "id_ed25519");
+  const privateKey = config.sshPrivateKey.endsWith("\n")
+    ? config.sshPrivateKey
+    : `${config.sshPrivateKey}\n`;
+
+  await writeFile(sshIdentityFile, privateKey, { mode: 0o600 });
+  await chmod(sshIdentityFile, 0o600);
+
+  return {
+    sshIdentityFile,
+    cleanup: async () => {
+      await rm(tempDir, { recursive: true, force: true });
+    },
+  };
 }
 
 function buildLoginShellScript(input: {
@@ -454,53 +491,58 @@ async function runSshCommand(
   options: { stdin?: string; timeoutMs?: number } = {},
 ): Promise<SshExecutionResult> {
   const timeoutMs = options.timeoutMs ?? config.timeoutMs;
+  const identity = await prepareSshIdentity(config);
 
-  return await new Promise((resolve, reject) => {
-    const child = spawn("ssh", buildSshArgs(config, vm, remoteCommand), {
-      stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let killTimer: NodeJS.Timeout | null = null;
-    const timer = timeoutMs > 0
-      ? setTimeout(() => {
-          timedOut = true;
-          child.kill("SIGTERM");
-          killTimer = setTimeout(() => {
-            child.kill("SIGKILL");
-          }, SSH_SIGKILL_GRACE_MS);
-        }, timeoutMs)
-      : null;
-
-    child.stdout?.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-    child.stderr?.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-    child.on("error", (error) => {
-      if (timer) clearTimeout(timer);
-      if (killTimer) clearTimeout(killTimer);
-      reject(error);
-    });
-    child.on("close", (code, signal) => {
-      if (timer) clearTimeout(timer);
-      if (killTimer) clearTimeout(killTimer);
-      resolve({
-        exitCode: timedOut ? null : code,
-        signal,
-        timedOut,
-        stdout,
-        stderr,
+  try {
+    return await new Promise((resolve, reject) => {
+      const child = spawn("ssh", buildSshArgs(config, vm, remoteCommand, identity.sshIdentityFile), {
+        stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
       });
-    });
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      let killTimer: NodeJS.Timeout | null = null;
+      const timer = timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            child.kill("SIGTERM");
+            killTimer = setTimeout(() => {
+              child.kill("SIGKILL");
+            }, SSH_SIGKILL_GRACE_MS);
+          }, timeoutMs)
+        : null;
 
-    if (options.stdin != null && child.stdin) {
-      child.stdin.write(options.stdin);
-      child.stdin.end();
-    }
-  });
+      child.stdout?.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      child.stderr?.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      child.on("error", (error) => {
+        if (timer) clearTimeout(timer);
+        if (killTimer) clearTimeout(killTimer);
+        reject(error);
+      });
+      child.on("close", (code, signal) => {
+        if (timer) clearTimeout(timer);
+        if (killTimer) clearTimeout(killTimer);
+        resolve({
+          exitCode: timedOut ? null : code,
+          signal,
+          timedOut,
+          stdout,
+          stderr,
+        });
+      });
+
+      if (options.stdin != null && child.stdin) {
+        child.stdin.write(options.stdin);
+        child.stdin.end();
+      }
+    });
+  } finally {
+    await identity.cleanup();
+  }
 }
 
 async function detectRemoteContext(

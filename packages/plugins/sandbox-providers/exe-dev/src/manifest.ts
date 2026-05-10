@@ -30,7 +30,7 @@ const manifest: PaperclipPluginManifestV1 = {
             type: "string",
             format: "secret-ref",
             description:
-              "Environment-specific exe.dev API token. Paste a token or an existing Paperclip secret reference; saved environments store pasted values as company secrets. Falls back to EXE_API_KEY if omitted.",
+              "Environment-specific exe.dev API token. Needs `/exec` permission for at least `new`, `ls`, and `rm`. Paste a token or an existing Paperclip secret reference; saved environments store pasted values as company secrets. Falls back to EXE_API_KEY if omitted.",
           },
           apiUrl: {
             type: "string",
@@ -104,10 +104,17 @@ const manifest: PaperclipPluginManifestV1 = {
             type: "string",
             description: "Optional SSH username for direct VM access.",
           },
+          sshPrivateKey: {
+            type: "string",
+            format: "secret-ref",
+            maxLength: 4096,
+            description:
+              "Optional exe.dev-registered SSH private key. Paste the private key or an existing Paperclip secret reference; saved environments store pasted values as company secrets. If omitted, Paperclip falls back to sshIdentityFile, then the host's default SSH agent/keychain.",
+          },
           sshIdentityFile: {
             type: "string",
             description:
-              "Optional absolute path to the SSH private key the Paperclip host should use for VM access.",
+              "Optional absolute path to the SSH private key the Paperclip host should use for VM access when sshPrivateKey is omitted. Leave both blank to rely on the host's default SSH agent/keychain.",
           },
           sshPort: {
             type: "number",

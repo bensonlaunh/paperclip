@@ -109,6 +109,7 @@ describe("exe.dev sandbox provider plugin", () => {
         timeoutMs: 450000,
         reuseLease: true,
         sshUser: null,
+        sshPrivateKey: null,
         sshIdentityFile: null,
         sshPort: 2222,
         strictHostKeyChecking: "accept-new",
@@ -204,6 +205,35 @@ describe("exe.dev sandbox provider plugin", () => {
         reuseLease: false,
       },
     });
+  });
+
+  it("uses a pasted sshPrivateKey when connecting to the VM", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        vm_name: "paperclip-env-run",
+        ssh_dest: "paperclip-env-run.exe.xyz",
+        https_url: "https://paperclip-env-run.exe.xyz",
+        status: "running",
+      }), { status: 200 }),
+    );
+    queueSpawnResult({ stdout: "/home/exe\nbash\n" });
+    queueSpawnResult({});
+
+    await plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      runId: "run-1",
+      config: {
+        apiKey: "api-key",
+        sshPrivateKey: "-----BEGIN PRIVATE KEY-----\npretend\n-----END PRIVATE KEY-----",
+      },
+    });
+
+    const firstSpawnArgs = spawnMock.mock.calls[0]?.[1] as string[] | undefined;
+    expect(firstSpawnArgs).toContain("-i");
+    expect(firstSpawnArgs).toContain("-o");
+    expect(firstSpawnArgs).toContain("IdentitiesOnly=yes");
   });
 
   it("surfaces exe.dev SSH onboarding guidance during lease acquisition", async () => {

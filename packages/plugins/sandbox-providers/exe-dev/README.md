@@ -17,14 +17,22 @@ From a Paperclip instance, install:
 Configure exe.dev from `Company Settings -> Environments`, not from the plugin's instance settings page.
 
 - Put the exe.dev API token on the sandbox environment itself.
-- When you save an environment, Paperclip stores pasted API keys as company secrets.
-- `EXE_API_KEY` remains an optional host-level fallback when an environment omits the key.
+- When you save an environment, Paperclip stores pasted API keys and pasted SSH private keys as company secrets.
+- `EXE_API_KEY` remains an optional host-level fallback when an environment omits the API token.
 - The current implementation provisions VMs through exe.dev's HTTPS API and runs commands through direct SSH to the created VM.
+
+To use the provider successfully, the environment/host needs all of the following:
+
+- An exe.dev API token that allows the lifecycle commands the provider uses: `new`, `ls`, and `rm`. `whoami` and `help` are recommended for manual debugging. `restart` is only needed if you extend the provider to restart retained VMs.
+- SSH access from the Paperclip host to the resulting `*.exe.xyz` VMs.
+- An SSH private key that exe.dev already recognizes. You can either:
+  - paste the private key into the environment config via `sshPrivateKey`
+  - point `sshIdentityFile` at an absolute host path
+  - or leave both blank and rely on the host's default SSH agent/keychain
+- The matching public key must already be registered with exe.dev before the provider can execute commands inside the VM.
 
 Operational notes:
 
-- The API token must allow the lifecycle commands the provider uses: `new`, `ls`, and `rm`. `restart` is only needed if you extend the provider to restart retained VMs.
-- The Paperclip host must have SSH access to the resulting `*.exe.xyz` VMs, and the SSH key it uses must already be registered with exe.dev. You can rely on the host's normal SSH config/agent or set `sshIdentityFile` in the environment config.
 - If exe.dev replies `Please complete registration by running: ssh exe.dev`, the host key has not finished exe.dev onboarding yet.
 - Reusable leases keep the VM alive between runs. exe.dev does not expose a documented "stop and later resume" command in the public CLI docs, so `reuseLease: true` means "retain the VM" rather than "suspend it."
 - The provisioning path uses `https://exe.dev/exec`, which exe.dev documents as a command-style HTTPS API with a 30-second request timeout. Typical `new` calls are expected to fit inside that limit; command execution does not use `/exec`.
