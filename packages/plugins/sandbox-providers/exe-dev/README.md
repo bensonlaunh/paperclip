@@ -24,9 +24,11 @@ Configure exe.dev from `Company Settings -> Environments`, not from the plugin's
 Operational notes:
 
 - The API token must allow the lifecycle commands the provider uses: `new`, `ls`, and `rm`. `restart` is only needed if you extend the provider to restart retained VMs.
-- The Paperclip host must have SSH access to the resulting `*.exe.xyz` VMs. You can rely on the host's normal SSH config/agent or set `sshIdentityFile` in the environment config.
+- The Paperclip host must have SSH access to the resulting `*.exe.xyz` VMs, and the SSH key it uses must already be registered with exe.dev. You can rely on the host's normal SSH config/agent or set `sshIdentityFile` in the environment config.
+- If exe.dev replies `Please complete registration by running: ssh exe.dev`, the host key has not finished exe.dev onboarding yet.
 - Reusable leases keep the VM alive between runs. exe.dev does not expose a documented "stop and later resume" command in the public CLI docs, so `reuseLease: true` means "retain the VM" rather than "suspend it."
 - The provisioning path uses `https://exe.dev/exec`, which exe.dev documents as a command-style HTTPS API with a 30-second request timeout. Typical `new` calls are expected to fit inside that limit; command execution does not use `/exec`.
+- Probes still create and delete a real exe.dev VM through `/exec`, so they incur the same lifecycle cost as a short-lived environment run.
 
 ## Local development
 

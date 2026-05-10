@@ -88,7 +88,7 @@ describe("exe.dev sandbox provider plugin", () => {
     expect(result).toEqual({
       ok: true,
       warnings: [
-        "The Paperclip host must have SSH access to the created exe.dev VM. The API token only covers provisioning.",
+        "The Paperclip host must have SSH access to the created exe.dev VM, and its SSH key must be registered with exe.dev. The API token only covers provisioning.",
         "reuseLease keeps the VM alive between runs; this provider does not suspend retained VMs.",
       ],
       normalizedConfig: {
@@ -116,6 +116,24 @@ describe("exe.dev sandbox provider plugin", () => {
     });
   });
 
+  it("normalizes trailing /exec apiUrl inputs without duplication", async () => {
+    process.env.EXE_API_KEY = "host-key";
+
+    const result = await plugin.definition.onEnvironmentValidateConfig?.({
+      driverKey: "exe-dev",
+      config: {
+        apiUrl: "https://exe.dev/exec/",
+      },
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      normalizedConfig: {
+        apiUrl: "https://exe.dev/exec",
+      },
+    });
+  });
+
   it("rejects invalid config", async () => {
     await expect(plugin.definition.onEnvironmentValidateConfig?.({
       driverKey: "exe-dev",
@@ -132,7 +150,7 @@ describe("exe.dev sandbox provider plugin", () => {
     })).resolves.toEqual({
       ok: false,
       warnings: [
-        "The Paperclip host must have SSH access to the created exe.dev VM. The API token only covers provisioning.",
+        "The Paperclip host must have SSH access to the created exe.dev VM, and its SSH key must be registered with exe.dev. The API token only covers provisioning.",
       ],
       errors: [
         "apiUrl must be a valid URL.",
@@ -185,6 +203,38 @@ describe("exe.dev sandbox provider plugin", () => {
         shellCommand: "bash",
         reuseLease: false,
       },
+    });
+  });
+
+  it("redacts sensitive lifecycle flags in API errors", async () => {
+    fetchMock.mockResolvedValueOnce(new Response("upstream boom", { status: 500 }));
+
+    const acquirePromise = plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      runId: "run-1",
+      config: {
+        apiKey: "api-key",
+        env: {
+          SECRET: "super-secret",
+        },
+        prompt: "build me a secret app",
+        setupScript: "export TOKEN=super-secret",
+      },
+    });
+
+    await expect(acquirePromise).rejects.toMatchObject({
+      name: "ExeDevApiError",
+      status: 500,
+      body: "upstream boom",
+    });
+
+    await acquirePromise?.catch((error: Error) => {
+      expect(error.message).toContain("--env='SECRET=[REDACTED]'");
+      expect(error.message).toContain("--prompt='[REDACTED]'");
+      expect(error.message).toContain("--setup-script='[REDACTED]'");
+      expect(error.message).not.toContain("super-secret");
     });
   });
 
@@ -260,6 +310,73 @@ describe("exe.dev sandbox provider plugin", () => {
     });
   });
 
+  it("probes by creating and then deleting a VM after SSH verification", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({
+          vm_name: "paperclip-probe",
+          ssh_dest: "paperclip-probe.exe.xyz",
+          status: "running",
+        }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    queueSpawnResult({ stdout: "/home/exe\nbash\n" });
+    queueSpawnResult({});
+
+    const result = await plugin.definition.onEnvironmentProbe?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      config: {
+        apiKey: "api-key",
+      },
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      summary: "Connected to exe.dev VM paperclip-probe.",
+      metadata: {
+        provider: "exe-dev",
+        vmName: "paperclip-probe",
+        sshDest: "paperclip-probe.exe.xyz",
+        shellCommand: "bash",
+      },
+    });
+    expect(String(fetchMock.mock.calls[1]?.[1]?.body ?? "")).toBe("rm --json 'paperclip-probe'");
+  });
+
+  it("cleans up the probe VM when SSH verification fails", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({
+          vm_name: "paperclip-probe",
+          ssh_dest: "paperclip-probe.exe.xyz",
+          status: "running",
+        }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    queueSpawnResult({ code: 1, stderr: "permission denied" });
+
+    const result = await plugin.definition.onEnvironmentProbe?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      config: {
+        apiKey: "api-key",
+      },
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      summary: "exe.dev environment probe failed.",
+      metadata: {
+        provider: "exe-dev",
+      },
+    });
+    expect(String(result?.metadata?.error ?? "")).toContain("permission denied");
+    expect(String(fetchMock.mock.calls[1]?.[1]?.body ?? "")).toBe("rm --json 'paperclip-probe'");
+  });
+
   it("deletes non-reusable leases on release", async () => {
     fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200 }));
 
@@ -276,5 +393,22 @@ describe("exe.dev sandbox provider plugin", () => {
     });
 
     expect(String(fetchMock.mock.calls[0]?.[1]?.body ?? "")).toBe("rm --json 'vm-1'");
+  });
+
+  it("destroys leases on demand", async () => {
+    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200 }));
+
+    await plugin.definition.onEnvironmentDestroyLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      providerLeaseId: "vm-2",
+      config: {
+        apiKey: "api-key",
+      },
+      leaseMetadata: {},
+    });
+
+    expect(String(fetchMock.mock.calls[0]?.[1]?.body ?? "")).toBe("rm --json 'vm-2'");
   });
 });

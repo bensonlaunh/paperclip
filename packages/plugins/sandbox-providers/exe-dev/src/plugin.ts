@@ -62,6 +62,7 @@ const DEFAULT_API_URL = "https://exe.dev/exec";
 const DEFAULT_TIMEOUT_MS = 300_000;
 const EXE_DEV_API_MAX_TIMEOUT_MS = 29_000;
 const SSH_SIGKILL_GRACE_MS = 250;
+const MAX_VM_RECORD_DEPTH = 4;
 
 class ExeDevApiError extends Error {
   readonly status: number;
@@ -129,9 +130,12 @@ function normalizeApiUrl(value: string | null): string {
   if (!trimmed) return DEFAULT_API_URL;
   try {
     const parsed = new URL(trimmed);
-    if (parsed.pathname === "/exec") return parsed.toString();
-    parsed.pathname = parsed.pathname.replace(/\/+$/, "");
-    parsed.pathname = `${parsed.pathname || ""}/exec`.replace(/\/{2,}/g, "/");
+    const normalizedPath = parsed.pathname.replace(/\/+$/, "") || "/";
+    if (normalizedPath === "/exec") {
+      parsed.pathname = "/exec";
+      return parsed.toString();
+    }
+    parsed.pathname = `${normalizedPath === "/" ? "" : normalizedPath}/exec`.replace(/\/{2,}/g, "/");
     return parsed.toString();
   } catch {
     return trimmed;
@@ -217,7 +221,6 @@ function buildEnvFlags(env: Record<string, string>): string[] {
 
 function buildCreateCommand(
   config: ExeDevDriverConfig,
-  params: PluginEnvironmentAcquireLeaseParams | PluginEnvironmentProbeParams,
   vmName: string,
 ): string {
   return [
@@ -239,9 +242,44 @@ function buildCreateCommand(
   ].join(" ");
 }
 
+function replaceLiteralAll(input: string, search: string, replacement: string): string {
+  return search.length === 0 ? input : input.split(search).join(replacement);
+}
+
+function redactCreateCommand(command: string, config: ExeDevDriverConfig): string {
+  let redacted = command;
+
+  for (const [key, value] of Object.entries(config.env)) {
+    redacted = replaceLiteralAll(
+      redacted,
+      `--env=${shellQuote(`${key}=${value}`)}`,
+      `--env=${shellQuote(`${key}=[REDACTED]`)}`,
+    );
+  }
+
+  if (config.prompt) {
+    redacted = replaceLiteralAll(
+      redacted,
+      `--prompt=${shellQuote(config.prompt)}`,
+      `--prompt=${shellQuote("[REDACTED]")}`,
+    );
+  }
+
+  if (config.setupScript) {
+    redacted = replaceLiteralAll(
+      redacted,
+      `--setup-script=${shellQuote(config.setupScript)}`,
+      `--setup-script=${shellQuote("[REDACTED]")}`,
+    );
+  }
+
+  return redacted;
+}
+
 async function runLifecycleCommand(
   config: ExeDevDriverConfig,
   command: string,
+  logCommand = command,
 ): Promise<unknown> {
   const response = await fetch(config.apiUrl, {
     method: "POST",
@@ -255,7 +293,7 @@ async function runLifecycleCommand(
   const body = await response.text();
   if (!response.ok) {
     throw new ExeDevApiError(
-      `exe.dev API command failed (${response.status}) for: ${command}`,
+      `exe.dev API command failed (${response.status}) for: ${logCommand}`,
       response.status,
       body,
     );
@@ -270,10 +308,11 @@ async function runLifecycleCommand(
   }
 }
 
-function parseVmRecord(value: unknown): ExeDevVmRecord | null {
+function parseVmRecord(value: unknown, depth = 0): ExeDevVmRecord | null {
+  if (depth > MAX_VM_RECORD_DEPTH) return null;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
-  const nested = parseVmRecord(record.vm) ?? parseVmRecord(record.data);
+  const nested = parseVmRecord(record.vm, depth + 1) ?? parseVmRecord(record.data, depth + 1);
   if (nested) return nested;
 
   const name = parseOptionalString(record.vm_name ?? record.name ?? record.vmName);
@@ -317,7 +356,8 @@ async function createVm(
   const vmName = "runId" in params
     ? buildVmName(config, params)
     : `${config.namePrefix}-probe-${randomUUID().slice(0, 8)}`.slice(0, 63);
-  const response = await runLifecycleCommand(config, buildCreateCommand(config, params, vmName));
+  const command = buildCreateCommand(config, vmName);
+  const response = await runLifecycleCommand(config, command, redactCreateCommand(command, config));
   const created = parseVmRecord(response) ?? await lookupVm(config, vmName);
   if (!created) {
     throw new Error(`exe.dev did not return VM metadata for ${vmName}.`);
@@ -572,7 +612,7 @@ const plugin = definePlugin({
     }
 
     warnings.push(
-      "The Paperclip host must have SSH access to the created exe.dev VM. The API token only covers provisioning.",
+      "The Paperclip host must have SSH access to the created exe.dev VM, and its SSH key must be registered with exe.dev. The API token only covers provisioning.",
     );
     if (config.reuseLease) {
       warnings.push("reuseLease keeps the VM alive between runs; this provider does not suspend retained VMs.");
