@@ -63,6 +63,8 @@ const DEFAULT_TIMEOUT_MS = 300_000;
 const EXE_DEV_API_MAX_TIMEOUT_MS = 29_000;
 const SSH_SIGKILL_GRACE_MS = 250;
 const MAX_VM_RECORD_DEPTH = 4;
+const EXE_DEV_SSH_ONBOARDING_MARKER = "Please complete registration by running: ssh exe.dev";
+const EXE_DEV_SSH_EMAIL_PROMPT = "Please enter your email address:";
 
 class ExeDevApiError extends Error {
   readonly status: number;
@@ -426,6 +428,25 @@ function buildLoginShellScript(input: {
   return lines.join(" && ");
 }
 
+function formatSshFailure(
+  action: string,
+  vmName: string,
+  result: Pick<SshExecutionResult, "stdout" | "stderr">,
+): string {
+  const combinedOutput = `${result.stderr}\n${result.stdout}`;
+  if (
+    combinedOutput.includes(EXE_DEV_SSH_ONBOARDING_MARKER)
+    || combinedOutput.includes(EXE_DEV_SSH_EMAIL_PROMPT)
+  ) {
+    return [
+      `Failed to ${action} exe.dev VM ${vmName}: the Paperclip host SSH key is not registered with exe.dev.`,
+      "Complete exe.dev's one-time SSH onboarding on this host by running `ssh exe.dev` and following the email verification prompt, then retry.",
+    ].join(" ");
+  }
+
+  return `Failed to ${action} exe.dev VM ${vmName}: ${result.stderr.trim() || result.stdout.trim() || "unknown error"}`;
+}
+
 async function runSshCommand(
   config: ExeDevDriverConfig,
   vm: ExeDevVmRecord,
@@ -494,9 +515,7 @@ async function detectRemoteContext(
     )}`,
   );
   if (result.timedOut || result.exitCode !== 0) {
-    throw new Error(
-      `Failed to inspect exe.dev VM ${vm.name}: ${result.stderr.trim() || result.stdout.trim() || "unknown error"}`,
-    );
+    throw new Error(formatSshFailure("inspect", vm.name, result));
   }
 
   const [homeDirRaw, shellRaw] = result.stdout.split(/\r?\n/);
@@ -518,9 +537,7 @@ async function ensureRemoteWorkspace(
     `sh -lc ${shellQuote(`mkdir -p ${shellQuote(remoteCwd)}`)}`,
   );
   if (result.timedOut || result.exitCode !== 0) {
-    throw new Error(
-      `Failed to create exe.dev workspace ${remoteCwd}: ${result.stderr.trim() || result.stdout.trim() || "unknown error"}`,
-    );
+    throw new Error(formatSshFailure("create workspace for", vm.name, result));
   }
 }
 
@@ -784,7 +801,10 @@ const plugin = definePlugin({
       signal: result.signal,
       timedOut: result.timedOut,
       stdout: result.stdout,
-      stderr: result.stderr,
+      stderr:
+        !result.timedOut && result.exitCode !== 0
+          ? formatSshFailure("execute commands on", vm.name, result)
+          : result.stderr,
       metadata: {
         provider: "exe-dev",
         vmName: vm.name,

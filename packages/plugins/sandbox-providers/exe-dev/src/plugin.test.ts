@@ -206,6 +206,34 @@ describe("exe.dev sandbox provider plugin", () => {
     });
   });
 
+  it("surfaces exe.dev SSH onboarding guidance during lease acquisition", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        vm_name: "paperclip-env-run",
+        ssh_dest: "paperclip-env-run.exe.xyz",
+        https_url: "https://paperclip-env-run.exe.xyz",
+        status: "running",
+      }), { status: 200 }),
+    );
+    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    queueSpawnResult({ code: 1, stdout: "Please complete registration by running: ssh exe.dev\n" });
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      runId: "run-1",
+      config: {
+        apiKey: "api-key",
+        timeoutMs: 300000,
+      },
+    })).rejects.toThrow(
+      "the Paperclip host SSH key is not registered with exe.dev",
+    );
+
+    expect(String(fetchMock.mock.calls[1]?.[1]?.body ?? "")).toBe("rm --json 'paperclip-env-run'");
+  });
+
   it("redacts sensitive lifecycle flags in API errors", async () => {
     fetchMock.mockResolvedValueOnce(new Response("upstream boom", { status: 500 }));
 
@@ -310,6 +338,32 @@ describe("exe.dev sandbox provider plugin", () => {
     });
   });
 
+  it("returns exe.dev SSH onboarding guidance for command execution failures", async () => {
+    queueSpawnResult({ code: 1, stdout: "Please complete registration by running: ssh exe.dev\n" });
+
+    const result = await plugin.definition.onEnvironmentExecute?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      config: {
+        apiKey: "api-key",
+        timeoutMs: 300000,
+      },
+      lease: {
+        providerLeaseId: "vm-1",
+        metadata: {
+          sshDest: "vm-1.exe.xyz",
+        },
+      },
+      command: "node",
+      args: ["-v"],
+    });
+
+    expect(result?.exitCode).toBe(1);
+    expect(String(result?.stderr ?? "")).toContain("the Paperclip host SSH key is not registered with exe.dev");
+    expect(String(result?.stderr ?? "")).toContain("ssh exe.dev");
+  });
+
   it("probes by creating and then deleting a VM after SSH verification", async () => {
     fetchMock
       .mockResolvedValueOnce(
@@ -374,6 +428,35 @@ describe("exe.dev sandbox provider plugin", () => {
       },
     });
     expect(String(result?.metadata?.error ?? "")).toContain("permission denied");
+    expect(String(fetchMock.mock.calls[1]?.[1]?.body ?? "")).toBe("rm --json 'paperclip-probe'");
+  });
+
+  it("returns onboarding guidance when probe hits exe.dev SSH registration", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({
+          vm_name: "paperclip-probe",
+          ssh_dest: "paperclip-probe.exe.xyz",
+          status: "running",
+        }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    queueSpawnResult({ code: 1, stdout: "Please complete registration by running: ssh exe.dev\n" });
+
+    const result = await plugin.definition.onEnvironmentProbe?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      config: {
+        apiKey: "api-key",
+      },
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      summary: "exe.dev environment probe failed.",
+    });
+    expect(String(result?.metadata?.error ?? "")).toContain("the Paperclip host SSH key is not registered with exe.dev");
     expect(String(fetchMock.mock.calls[1]?.[1]?.body ?? "")).toBe("rm --json 'paperclip-probe'");
   });
 
